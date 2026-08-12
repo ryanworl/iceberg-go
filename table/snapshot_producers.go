@@ -1000,6 +1000,17 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 		})
 	}
 
+	// Delete-file removals are resolved against the snapshot this
+	// producer built on — removal identity is snapshot-relative. A
+	// refresh-and-replay could inherit a concurrently committed
+	// replacement from the fresh base while replaying the stale
+	// removals, stranding two live deletion vectors on one data file,
+	// so the commit must fail on a CAS conflict instead of replaying
+	// (see commitOpts.noReplay).
+	if len(sp.deletedDeleteFiles) > 0 {
+		sp.txn.setNoReplay()
+	}
+
 	// Build the manifest-list rebuild closure. It is called by doCommit
 	// on each OCC retry to regenerate the manifest list so it correctly
 	// inherits all data files committed by concurrent writers since the

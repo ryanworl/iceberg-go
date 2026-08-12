@@ -19,10 +19,12 @@ package table_test
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -1082,6 +1084,117 @@ func TestRowDeltaRemoveDeletesSharedPuffin(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "removed delete files must be unique")
 	})
+}
+
+// enforcingRowDeltaCatalog mirrors a real optimistic-concurrency
+// catalog: it validates every requirement against its current metadata
+// (returning ErrCommitFailed-wrapped errors on mismatch, which is what
+// arms doCommit's retry loop), applies updates on success, and counts
+// CommitTable attempts.
+type enforcingRowDeltaCatalog struct {
+	metadata table.Metadata
+	attempts atomic.Int32
+}
+
+func (m *enforcingRowDeltaCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return table.New(ident, m.metadata, "",
+		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, m), nil
+}
+
+func (m *enforcingRowDeltaCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	m.attempts.Add(1)
+	for _, req := range reqs {
+		if err := req.Validate(m.metadata); err != nil {
+			return nil, "", fmt.Errorf("%w: %w", table.ErrCommitFailed, err)
+		}
+	}
+
+	meta, err := table.UpdateTableMetadata(m.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+	m.metadata = meta
+
+	return meta, "", nil
+}
+
+// Why: delete-file removals are resolved against the snapshot the
+// writer built on. If a commit carrying removals entered doCommit's
+// refresh-and-replay after a CAS conflict, a concurrent DV replacement
+// could be inherited from the fresh base while the stale removal is
+// replayed as a no-op — two live DVs for one data file. Such commits
+// must fail on conflict instead of replaying.
+// Condition: a v3 table with a live DV; a peer supersedes it; a stale
+// writer (still on the pre-peer view) then commits its own supersession
+// with retries enabled against a requirement-enforcing catalog.
+// Assertion: the stale commit fails wrapping ErrCommitFailed after
+// exactly one CommitTable attempt (no replay), and the table still
+// carries exactly the peer's DV live.
+func TestRowDeltaRemoveDeletesNoReplayOnConflict(t *testing.T) {
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location, iceberg.Properties{
+			table.PropertyFormatVersion:   "3",
+			table.CommitNumRetriesKey:     "2",
+			table.CommitMinRetryWaitMsKey: "1",
+			table.CommitMaxRetryWaitMsKey: "2",
+		})
+	require.NoError(t, err)
+
+	cat := &enforcingRowDeltaCatalog{metadata: meta}
+	tbl := table.New(
+		table.Identifier{"db", "row_delta_no_replay"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		cat,
+	)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	dataPath := location + "/data/data-001.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "alpha"}, {"id": 2, "data": "beta"}]`)
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	dv1 := writeDV(t, location, "dv-001.puffin", dataPath, []int64{0})
+	tx2 := tbl.NewTransaction()
+	require.NoError(t, tx2.NewRowDelta(nil).AddDeletes(dv1).Commit(t.Context()))
+	tbl, err = tx2.Commit(t.Context())
+	require.NoError(t, err)
+
+	// Peer supersession commits first, from the same table view.
+	dvPeer := writeDV(t, location, "dv-peer.puffin", dataPath, []int64{0, 1})
+	txPeer := tbl.NewTransaction()
+	require.NoError(t, txPeer.NewRowDelta(nil).AddDeletes(dvPeer).RemoveDeletes(dv1).Commit(t.Context()))
+	_, err = txPeer.Commit(t.Context())
+	require.NoError(t, err)
+
+	// Stale writer still sees dv1 live and supersedes it too.
+	attemptsBefore := cat.attempts.Load()
+	dvStale := writeDV(t, location, "dv-stale.puffin", dataPath, []int64{0})
+	txStale := tbl.NewTransaction()
+	require.NoError(t, txStale.NewRowDelta(nil).AddDeletes(dvStale).RemoveDeletes(dv1).Commit(t.Context()))
+
+	_, err = txStale.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrCommitFailed)
+	assert.Equal(t, attemptsBefore+1, cat.attempts.Load(),
+		"a commit with removals must fail on the first CAS conflict, not refresh-and-replay")
+
+	// The table is uncorrupted: exactly the peer's DV is live.
+	snap := cat.metadata.CurrentSnapshot()
+	require.NotNil(t, snap)
+	live, removed := snapshotDeleteEntryFiles(t, snap, iceio.LocalFS{})
+	assert.Equal(t, [][2]string{{dvPeer.FilePath(), dataPath}}, pathRefPairs(live),
+		"the data file must carry exactly one live DV: the peer's")
+	assert.Equal(t, [][2]string{{dv1.FilePath(), dataPath}}, pathRefPairs(removed))
 }
 
 // Why: a removal the producer cannot match against a live delete entry

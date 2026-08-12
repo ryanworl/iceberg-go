@@ -98,6 +98,12 @@ type Transaction struct {
 	// a moved branch must fail the commit rather than be replayed.
 	pinnedRefs map[string]struct{}
 
+	// noReplay marks the commit as non-replayable — on a CAS conflict
+	// doCommit fails instead of refreshing and replaying. Set by
+	// producers whose staged snapshot carries delete-file removals;
+	// see setNoReplay.
+	noReplay bool
+
 	mx        sync.Mutex
 	committed bool
 }
@@ -210,6 +216,16 @@ func formatSnapshotID(id *int64) string {
 	}
 
 	return strconv.FormatInt(*id, 10)
+}
+
+// setNoReplay marks this transaction's commit as non-replayable: on a
+// CAS conflict, doCommit fails with ErrCommitFailed instead of
+// refreshing and replaying. Producers call this when the commit
+// carries delete-file removals, whose identity is snapshot-relative.
+func (t *Transaction) setNoReplay() {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	t.noReplay = true
 }
 
 // addValidator appends a conflict validator under t.mx. Producers
@@ -1892,6 +1908,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 			withCommitBranch(t.branch),
 			withCommitValidators(t.validators...),
 			withCommitPinnedRefs(t.pinnedRefs),
+			withCommitNoReplay(t.noReplay),
 		)
 		if err != nil {
 			return tbl, err

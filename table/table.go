@@ -361,6 +361,16 @@ type commitOpts struct {
 	// the fresh branch head between retries — the committer asked for
 	// compare-and-swap semantics on those branches.
 	pinnedRefs map[string]struct{}
+
+	// noReplay disables refresh-and-replay entirely: on a CAS
+	// conflict the commit fails with ErrCommitFailed instead of
+	// retrying against the refreshed catalog state. Producers set
+	// this when the commit carries delete-file removals — the removed
+	// entries were resolved against the snapshot the writer built on,
+	// and replaying the stale removals against a refreshed base could
+	// silently miss a concurrently committed replacement (e.g. two
+	// live deletion vectors for one data file).
+	noReplay bool
 }
 
 type commitOption func(*commitOpts)
@@ -383,6 +393,10 @@ func withCommitValidators(vs ...conflictValidatorFunc) commitOption {
 
 func withCommitPinnedRefs(refs map[string]struct{}) commitOption {
 	return func(o *commitOpts) { o.pinnedRefs = refs }
+}
+
+func withCommitNoReplay(noReplay bool) commitOption {
+	return func(o *commitOpts) { o.noReplay = noReplay }
 }
 
 func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requirement, opts ...commitOption) (*Table, error) {
@@ -536,6 +550,18 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		if !errors.Is(err, ErrCommitFailed) {
 			cleanupOrphans = false
 
+			return nil, err
+		}
+
+		// Non-replayable commits fail on the first CAS conflict
+		// instead of entering refresh-and-replay. Delete-file removals
+		// are resolved against the snapshot the writer built on
+		// (snapshot-relative identity); replaying the stale removals
+		// against a refreshed base could silently miss a concurrently
+		// committed replacement and strand two live deletion vectors
+		// on one data file. The caller must rebuild the removal
+		// against the current snapshot and try again.
+		if co.noReplay {
 			return nil, err
 		}
 	}

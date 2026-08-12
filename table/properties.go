@@ -101,14 +101,17 @@ const (
 	MaxRefAgeMsDefault = math.MaxInt
 
 	// CommitNumRetriesKey is the number of commit retry attempts before
-	// giving up on ErrCommitFailed from the catalog.
+	// giving up on ErrCommitFailed from the catalog. On each retry
+	// doCommit refreshes the catalog state and replays the staged
+	// changes onto the fresh base (refresh-and-replay), so retried
+	// commits land on top of concurrent ones instead of failing
+	// deterministically.
 	//
-	// The default is 0 (no retries) until refresh-and-replay lands; a
-	// retry loop that reuses the original updates/requirements will
-	// fail deterministically on genuine OCC conflicts and only slow
-	// down the final error. Callers that observe transient catalog
-	// flakiness (dropped connections, brief 409 during leader
-	// election) can raise this to recover.
+	// The default is 0 (no retries) to preserve this module's
+	// historical fail-fast behavior; raising it is an explicit opt-in
+	// to replay semantics. Java defaults to 4. Commits that pin a
+	// branch explicitly (Transaction.AssertRefSnapshotID) or carry
+	// delete-file removals never replay regardless of this setting.
 	CommitNumRetriesKey     = "commit.retry.num-retries"
 	CommitNumRetriesDefault = 0
 
