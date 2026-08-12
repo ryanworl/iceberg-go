@@ -28,8 +28,10 @@ import (
 	"strings"
 
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/config"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
+	"golang.org/x/sync/errgroup"
 )
 
 type Operation string
@@ -344,20 +346,53 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 			return
 		}
 
-		for _, m := range manifests {
-			for entry, err := range m.Entries(fio, false) {
-				if err != nil {
-					yield(nil, err)
+		// Each manifest is a separate object-store read, so a sequential
+		// walk costs O(manifests x round-trip). Fetch and parse the
+		// manifests with bounded concurrency, then yield in manifest
+		// order so callers observe the same deterministic sequence as a
+		// sequential read.
+		results := make([][]iceberg.DataFile, len(manifests))
+		errs := make([]error, len(manifests))
 
-					return
-				}
+		var g errgroup.Group
+		g.SetLimit(min(config.EnvConfig.MaxWorkers, len(manifests)))
+		for i, m := range manifests {
+			g.Go(func() error {
+				// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
+				capacity := int(m.AddedDataFiles()) + int(m.ExistingDataFiles())
+				files := make([]iceberg.DataFile, 0, max(0, capacity))
+				for entry, err := range m.Entries(fio, false) {
+					if err != nil {
+						errs[i] = err
 
-				if fileFilter != nil {
-					if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
-						continue
+						return nil
 					}
+
+					if fileFilter != nil {
+						if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
+							continue
+						}
+					}
+					files = append(files, entry.DataFile())
 				}
-				if !yield(entry.DataFile(), nil) {
+				results[i] = files
+
+				return nil
+			})
+		}
+		// Worker errors are recorded per manifest and reported in
+		// manifest order below, so the first error a caller sees does
+		// not depend on goroutine scheduling.
+		_ = g.Wait()
+
+		for i := range manifests {
+			if errs[i] != nil {
+				yield(nil, errs[i])
+
+				return
+			}
+			for _, df := range results[i] {
+				if !yield(df, nil) {
 					return
 				}
 			}
