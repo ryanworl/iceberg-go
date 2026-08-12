@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"iter"
 	"maps"
 	"slices"
 	"sort"
@@ -74,6 +75,22 @@ func (b *RoaringPositionBitmap) Contains(pos uint64) bool {
 	}
 
 	return bm.Contains(low)
+}
+
+// Positions returns an iterator over every set position in ascending
+// order. The positions yielded are the same 64-bit values passed to Set.
+func (b *RoaringPositionBitmap) Positions() iter.Seq[uint64] {
+	return func(yield func(uint64) bool) {
+		for _, key := range b.sortedKeys() {
+			high := uint64(key) << 32
+			it := b.bitmaps[key].Iterator()
+			for it.HasNext() {
+				if !yield(high | uint64(it.Next())) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // IsEmpty returns true if no positions are set.
