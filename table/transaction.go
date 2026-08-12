@@ -290,9 +290,11 @@ func (t *Transaction) SetProperties(props iceberg.Properties) error {
 //
 // The requirement is submitted together with the transaction's
 // updates; a transaction with no updates never contacts the catalog,
-// so the fence alone does not force a commit. Requirements are
-// deduplicated by type across the transaction, so the first
-// AssertRefSnapshotID registered — explicit or producer-built — wins.
+// so the fence alone does not force a commit. Ref assertions are
+// deduplicated by (type, ref): an explicit fence and a producer-built
+// assertion for the same branch pinning the same snapshot collapse to
+// one, while two assertions for the same branch pinning different
+// snapshot ids are a conflict and fail the commit.
 func (t *Transaction) AssertRefSnapshotID(branch string) error {
 	if branch == "" {
 		branch = MainBranch
