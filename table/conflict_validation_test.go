@@ -19,9 +19,12 @@ package table
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -266,6 +269,60 @@ func TestValidateDataFilesExist_EmptyInput(t *testing.T) {
 
 	require.NoError(t, validateDataFilesExist(ctx, nil))
 	require.NoError(t, validateDataFilesExist(ctx, []string{}))
+}
+
+// Why: a manifest entry with status DELETED records a file's removal;
+// treating it as reachable would let a pos-delete commit reference a
+// file the branch head has already deleted, producing incorrect results
+// when the delete is applied against rewritten data.
+// Condition: the branch head's manifest carries an ADDED entry for one
+// file and a DELETED entry for another.
+// Assertion: the added file satisfies the existence check; the deleted
+// file reports ErrDataFilesMissing.
+func TestValidateDataFilesExist_IgnoresDeletedEntries(t *testing.T) {
+	fs := iceio.LocalFS{}
+	dir := filepath.ToSlash(t.TempDir())
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "metadata"), 0o755))
+
+	livePath := dir + "/data/live.parquet"
+	gonePath := dir + "/data/gone.parquet"
+	manifests := []iceberg.ManifestFile{
+		writeSnapshotTestManifest(t, fs, dir+"/metadata/manifest-0.avro",
+			iceberg.ManifestContentData,
+			[]iceberg.DataFile{buildTestDataFileEntry(t, livePath, iceberg.EntryContentData)},
+			[]iceberg.DataFile{buildTestDataFileEntry(t, gonePath, iceberg.EntryContentData)}),
+	}
+	listPath := writeSnapshotTestManifestList(t, fs, dir, manifests)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+	meta, err := NewMetadata(schema, iceberg.UnpartitionedSpec, UnsortedSortOrder,
+		"file://"+dir, iceberg.Properties{PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+	builder, err := MetadataBuilderFromBase(meta, "")
+	require.NoError(t, err)
+	require.NoError(t, builder.AddSnapshot(&Snapshot{
+		SnapshotID:     1,
+		SequenceNumber: 1,
+		TimestampMs:    meta.LastUpdatedMillis() + 1,
+		ManifestList:   listPath,
+		Summary:        &Summary{Operation: OpAppend},
+	}))
+	require.NoError(t, builder.SetSnapshotRef(MainBranch, 1, BranchRef))
+	current, err := builder.Build()
+	require.NoError(t, err)
+
+	ctx, err := newConflictContext(current, current, MainBranch, fs, true)
+	require.NoError(t, err)
+
+	require.NoError(t, validateDataFilesExist(ctx, []string{livePath}),
+		"an ADDED entry must satisfy the existence check")
+
+	err = validateDataFilesExist(ctx, []string{gonePath})
+	require.Error(t, err, "a file deleted by the branch head must not be treated as reachable")
+	assert.ErrorIs(t, err, ErrDataFilesMissing)
+	assert.Contains(t, err.Error(), gonePath)
 }
 
 func TestValidateNoNewDeletesForRewrittenFiles_EmptyInputs(t *testing.T) {

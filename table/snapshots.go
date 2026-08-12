@@ -361,7 +361,11 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 				// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
 				capacity := int(m.AddedDataFiles()) + int(m.ExistingDataFiles())
 				files := make([]iceberg.DataFile, 0, max(0, capacity))
-				for entry, err := range m.Entries(fio, false) {
+				// Discard DELETED entries: they are tombstones recording a
+				// removal, not files reachable from this snapshot. Yielding
+				// them would make existence and duplicate checks treat a
+				// file deleted by this snapshot as still live.
+				for entry, err := range m.Entries(fio, true) {
 					if err != nil {
 						errs[i] = err
 

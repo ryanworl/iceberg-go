@@ -40,7 +40,10 @@ func buildTestDataFileEntry(t *testing.T, path string, content iceberg.ManifestE
 	return b.Build()
 }
 
-func writeSnapshotTestManifest(t *testing.T, fs iceio.WriteFileIO, path string, content iceberg.ManifestContent, files []iceberg.DataFile) iceberg.ManifestFile {
+// writeSnapshotTestManifest writes a manifest containing the given files
+// with status ADDED and deletedFiles with status DELETED (tombstones for
+// files removed by the snapshot).
+func writeSnapshotTestManifest(t *testing.T, fs iceio.WriteFileIO, path string, content iceberg.ManifestContent, files, deletedFiles []iceberg.DataFile) iceberg.ManifestFile {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -53,6 +56,12 @@ func writeSnapshotTestManifest(t *testing.T, fs iceio.WriteFileIO, path string, 
 		require.NoError(t, wr.Add(iceberg.NewManifestEntry(
 			iceberg.EntryStatusADDED, &snapshotID, nil, nil, df)))
 	}
+	// Non-ADDED entries must carry explicit sequence numbers.
+	seq := int64(1)
+	for _, df := range deletedFiles {
+		require.NoError(t, wr.Delete(iceberg.NewManifestEntry(
+			iceberg.EntryStatusDELETED, &snapshotID, &seq, &seq, df)))
+	}
 	require.NoError(t, wr.Close())
 	require.NoError(t, fs.WriteFile(path, buf.Bytes()))
 
@@ -60,6 +69,21 @@ func writeSnapshotTestManifest(t *testing.T, fs iceio.WriteFileIO, path string, 
 	require.NoError(t, err)
 
 	return mf
+}
+
+// writeSnapshotTestManifestList writes a manifest list referencing the
+// given manifests in order and returns its path.
+func writeSnapshotTestManifestList(t *testing.T, fs iceio.WriteFileIO, dir string, manifests []iceberg.ManifestFile) string {
+	t.Helper()
+
+	listPath := dir + "/metadata/manifest-list.avro"
+	out, err := fs.Create(listPath)
+	require.NoError(t, err)
+	seq := int64(1)
+	require.NoError(t, iceberg.WriteManifestList(2, out, 1, nil, &seq, 0, manifests))
+	require.NoError(t, out.Close())
+
+	return listPath
 }
 
 // newMultiManifestSnapshot writes nData data manifests of two data files
@@ -82,21 +106,16 @@ func newMultiManifestSnapshot(t *testing.T, fs iceio.WriteFileIO, dir string, nD
 		}
 		manifests = append(manifests, writeSnapshotTestManifest(t, fs,
 			fmt.Sprintf("%s/metadata/manifest-%d.avro", dir, m),
-			iceberg.ManifestContentData, files))
+			iceberg.ManifestContentData, files, nil))
 	}
 
 	delPath := dir + "/data/pos-del.parquet"
 	manifests = append(manifests, writeSnapshotTestManifest(t, fs,
 		dir+"/metadata/manifest-deletes.avro", iceberg.ManifestContentDeletes,
-		[]iceberg.DataFile{buildTestDataFileEntry(t, delPath, iceberg.EntryContentPosDeletes)}))
+		[]iceberg.DataFile{buildTestDataFileEntry(t, delPath, iceberg.EntryContentPosDeletes)}, nil))
 	paths = append(paths, delPath)
 
-	listPath := dir + "/metadata/manifest-list.avro"
-	out, err := fs.Create(listPath)
-	require.NoError(t, err)
-	seq := int64(1)
-	require.NoError(t, iceberg.WriteManifestList(2, out, 1, nil, &seq, 0, manifests))
-	require.NoError(t, out.Close())
+	listPath := writeSnapshotTestManifestList(t, fs, dir, manifests)
 
 	return Snapshot{SnapshotID: 1, SequenceNumber: 1, ManifestList: listPath}, paths
 }
@@ -170,6 +189,50 @@ func TestSnapshotDataFilesManifestReadError(t *testing.T) {
 
 	require.Error(t, iterErr)
 	assert.Equal(t, want[:2], got, "entries before the failing manifest must be yielded in order")
+}
+
+// Why: a manifest entry with status DELETED is a tombstone recording a
+// removal, not a file reachable from the snapshot. Yielding it would make
+// existence and duplicate checks (validateDataFilesExist, ReplaceFiles'
+// belong-to-table check, AddFiles' duplicate walk) treat a file deleted
+// by the snapshot as still live.
+// Condition: a snapshot whose data and delete manifests each carry one
+// ADDED and one DELETED entry.
+// Assertion: only the ADDED entries are yielded.
+func TestSnapshotDataFilesSkipsDeletedEntries(t *testing.T) {
+	fs := iceio.LocalFS{}
+	dir := filepath.ToSlash(t.TempDir())
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "metadata"), 0o755))
+
+	liveData := dir + "/data/live.parquet"
+	goneData := dir + "/data/gone.parquet"
+	liveDel := dir + "/data/live-del.parquet"
+	goneDel := dir + "/data/gone-del.parquet"
+
+	manifests := []iceberg.ManifestFile{
+		writeSnapshotTestManifest(t, fs, dir+"/metadata/manifest-0.avro",
+			iceberg.ManifestContentData,
+			[]iceberg.DataFile{buildTestDataFileEntry(t, liveData, iceberg.EntryContentData)},
+			[]iceberg.DataFile{buildTestDataFileEntry(t, goneData, iceberg.EntryContentData)}),
+		writeSnapshotTestManifest(t, fs, dir+"/metadata/manifest-1.avro",
+			iceberg.ManifestContentDeletes,
+			[]iceberg.DataFile{buildTestDataFileEntry(t, liveDel, iceberg.EntryContentPosDeletes)},
+			[]iceberg.DataFile{buildTestDataFileEntry(t, goneDel, iceberg.EntryContentPosDeletes)}),
+	}
+	snap := Snapshot{
+		SnapshotID:     1,
+		SequenceNumber: 1,
+		ManifestList:   writeSnapshotTestManifestList(t, fs, dir, manifests),
+	}
+
+	var got []string
+	for df, err := range snap.dataFiles(fs, nil) {
+		require.NoError(t, err)
+		got = append(got, df.FilePath())
+	}
+
+	assert.Equal(t, []string{liveData, liveDel}, got,
+		"DELETED entries must not be yielded as reachable files")
 }
 
 // Why: range-over-func consumers may stop early; the iterator must honor
