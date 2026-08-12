@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/config"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -253,4 +256,68 @@ func TestSnapshotDataFilesEarlyBreak(t *testing.T) {
 	}
 
 	assert.Equal(t, want[:1], got)
+}
+
+// countingFS wraps an IO and counts Open calls; used to observe how
+// many manifests an iteration actually reads. Opening any file the
+// allow predicate rejects blocks on gate, freezing the count so the
+// test can assert it without racing the prefetch workers.
+type countingFS struct {
+	iceio.IO
+	opens atomic.Int32
+	allow func(name string) bool
+	gate  chan struct{}
+}
+
+func (c *countingFS) Open(name string) (iceio.File, error) {
+	c.opens.Add(1)
+	if !c.allow(name) {
+		<-c.gate
+	}
+
+	return c.IO.Open(name)
+}
+
+// Why: the ordered parallel prefetch must stay lazy — dataFiles streams
+// per-manifest results as they complete, so an early break must cancel
+// the manifests that have not been read yet instead of buffering the
+// whole snapshot up front.
+// Condition: a snapshot with nine manifests, a single prefetch worker,
+// and a consumer that breaks after the first yielded file. The counting
+// FS lets the manifest list and the first manifest through and blocks
+// any other open, so the count is stable when asserted.
+// Assertion: strictly fewer file opens than a full read (one for the
+// manifest list plus one per manifest) would perform — at most the two
+// allowed opens plus one worker already in flight at cancellation.
+func TestSnapshotDataFilesEarlyBreakStopsReading(t *testing.T) {
+	oldWorkers := config.EnvConfig.MaxWorkers
+	config.EnvConfig.MaxWorkers = 1
+	t.Cleanup(func() { config.EnvConfig.MaxWorkers = oldWorkers })
+
+	dir := filepath.ToSlash(t.TempDir())
+	snap, _ := newMultiManifestSnapshot(t, iceio.LocalFS{}, dir, 8)
+
+	firstManifest := dir + "/metadata/manifest-0.avro"
+	fs := &countingFS{
+		IO: iceio.LocalFS{},
+		allow: func(name string) bool {
+			return strings.HasSuffix(name, snap.ManifestList) || strings.HasSuffix(name, firstManifest)
+		},
+		gate: make(chan struct{}),
+	}
+	for df, err := range snap.dataFiles(fs, nil) {
+		require.NoError(t, err)
+		require.NotNil(t, df)
+
+		break
+	}
+
+	fullRead := int32(1 + 8 + 1) // manifest list + 8 data manifests + 1 delete manifest
+	assert.LessOrEqual(t, fs.opens.Load(), int32(3),
+		"an early break must leave unread manifests unread")
+	assert.Less(t, fs.opens.Load(), fullRead)
+
+	// Unblock the worker (if any) that was already in flight when the
+	// break cancelled the pipeline so it can finish and exit.
+	close(fs.gate)
 }

@@ -18,6 +18,7 @@
 package table
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,6 @@ import (
 	"github.com/apache/iceberg-go/config"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
-	"golang.org/x/sync/errgroup"
 )
 
 type Operation string
@@ -347,55 +347,78 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 		}
 
 		// Each manifest is a separate object-store read, so a sequential
-		// walk costs O(manifests x round-trip). Fetch and parse the
-		// manifests with bounded concurrency, then yield in manifest
-		// order so callers observe the same deterministic sequence as a
-		// sequential read.
-		results := make([][]iceberg.DataFile, len(manifests))
-		errs := make([]error, len(manifests))
-
-		var g errgroup.Group
-		g.SetLimit(min(config.EnvConfig.MaxWorkers, len(manifests)))
-		for i, m := range manifests {
-			g.Go(func() error {
-				// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
-				capacity := int(m.AddedDataFiles()) + int(m.ExistingDataFiles())
-				files := make([]iceberg.DataFile, 0, max(0, capacity))
-				// Discard DELETED entries: they are tombstones recording a
-				// removal, not files reachable from this snapshot. Yielding
-				// them would make existence and duplicate checks treat a
-				// file deleted by this snapshot as still live.
-				for entry, err := range m.Entries(fio, true) {
-					if err != nil {
-						errs[i] = err
-
-						return nil
-					}
-
-					if fileFilter != nil {
-						if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
-							continue
-						}
-					}
-					files = append(files, entry.DataFile())
-				}
-				results[i] = files
-
-				return nil
-			})
+		// walk costs O(manifests x round-trip). Prefetch and parse the
+		// manifests as a bounded ordered window ahead of the consumer,
+		// streaming each manifest's result in manifest order as it
+		// completes: callers observe the same deterministic sequence
+		// (entries and errors) as a sequential read, without buffering
+		// the whole snapshot first. An early break cancels the
+		// dispatcher, so manifests not yet admitted are never read;
+		// exactly one send goes into each 1-buffered channel, so no
+		// goroutine leaks.
+		type manifestFiles struct {
+			files []iceberg.DataFile
+			err   error
 		}
-		// Worker errors are recorded per manifest and reported in
-		// manifest order below, so the first error a caller sees does
-		// not depend on goroutine scheduling.
-		_ = g.Wait()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		results := make([]chan manifestFiles, len(manifests))
+		for i := range results {
+			results[i] = make(chan manifestFiles, 1)
+		}
+
+		go func() {
+			// Admit workers in manifest order so the prefetch window
+			// tracks the consumer's position instead of reading
+			// arbitrary manifests first.
+			sem := make(chan struct{}, min(config.EnvConfig.MaxWorkers, len(manifests)))
+			for i, m := range manifests {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					results[i] <- manifestFiles{err: context.Cause(ctx)}
+
+					continue
+				}
+				go func() {
+					defer func() { <-sem }()
+
+					// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
+					capacity := int(m.AddedDataFiles()) + int(m.ExistingDataFiles())
+					files := make([]iceberg.DataFile, 0, max(0, capacity))
+					// Discard DELETED entries: they are tombstones recording a
+					// removal, not files reachable from this snapshot. Yielding
+					// them would make existence and duplicate checks treat a
+					// file deleted by this snapshot as still live.
+					for entry, err := range m.Entries(fio, true) {
+						if err != nil {
+							results[i] <- manifestFiles{err: err}
+
+							return
+						}
+
+						if fileFilter != nil {
+							if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
+								continue
+							}
+						}
+						files = append(files, entry.DataFile())
+					}
+					results[i] <- manifestFiles{files: files}
+				}()
+			}
+		}()
 
 		for i := range manifests {
-			if errs[i] != nil {
-				yield(nil, errs[i])
+			r := <-results[i]
+			if r.err != nil {
+				yield(nil, r.err)
 
 				return
 			}
-			for _, df := range results[i] {
+			for _, df := range r.files {
 				if !yield(df, nil) {
 					return
 				}
