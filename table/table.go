@@ -354,6 +354,13 @@ type commitOpts struct {
 	// snapshots and validators short-circuit; on retries they run
 	// against the freshly refreshed catalog state (refresh-and-replay).
 	validators []conflictValidatorFunc
+
+	// pinnedRefs names branches whose AssertRefSnapshotID requirements
+	// were registered explicitly by the committer
+	// (Transaction.AssertRefSnapshotID) and must not be rewritten to
+	// the fresh branch head between retries — the committer asked for
+	// compare-and-swap semantics on those branches.
+	pinnedRefs map[string]struct{}
 }
 
 type commitOption func(*commitOpts)
@@ -372,6 +379,10 @@ func withCommitBranch(branch string) commitOption {
 
 func withCommitValidators(vs ...conflictValidatorFunc) commitOption {
 	return func(o *commitOpts) { o.validators = append(o.validators, vs...) }
+}
+
+func withCommitPinnedRefs(refs map[string]struct{}) commitOption {
+	return func(o *commitOpts) { o.pinnedRefs = refs }
 }
 
 func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requirement, opts ...commitOption) (*Table, error) {
@@ -461,7 +472,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				return nil, fmt.Errorf("refresh table for retry: %w", refreshErr)
 			}
 			current = fresh.metadata
-			reqs = rewriteRefSnapshotRequirements(reqs, co.branch, current)
+			reqs = rewriteRefSnapshotRequirements(reqs, co.branch, current, co.pinnedRefs)
 
 			// Rebuild snapshot manifest lists to inherit all files committed
 			// by concurrent writers since the snapshot was originally built.
@@ -553,7 +564,12 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 // the branch is empty or the new head cannot be resolved (branch
 // deleted underneath us), reqs is returned unchanged — newConflict-
 // Context will surface the divergence on the next pre-flight pass.
-func rewriteRefSnapshotRequirements(reqs []Requirement, branch string, fresh Metadata) []Requirement {
+//
+// Assertions on branches in pinned were registered explicitly by the
+// committer (Transaction.AssertRefSnapshotID) as a compare-and-swap
+// fence and are never rewritten: a moved branch must fail the commit,
+// not be replayed against the new head.
+func rewriteRefSnapshotRequirements(reqs []Requirement, branch string, fresh Metadata, pinned map[string]struct{}) []Requirement {
 	if branch == "" || fresh == nil {
 		return reqs
 	}
@@ -565,10 +581,12 @@ func rewriteRefSnapshotRequirements(reqs []Requirement, branch string, fresh Met
 	out := make([]Requirement, len(reqs))
 	for i, r := range reqs {
 		if a, ok := r.(*assertRefSnapshotID); ok && a.Ref == branch {
-			newID := head.SnapshotID
-			out[i] = AssertRefSnapshotID(branch, &newID)
+			if _, isPinned := pinned[a.Ref]; !isPinned {
+				newID := head.SnapshotID
+				out[i] = AssertRefSnapshotID(branch, &newID)
 
-			continue
+				continue
+			}
 		}
 		out[i] = r
 	}

@@ -201,7 +201,7 @@ func TestRewriteRefSnapshotRequirements(t *testing.T) {
 	newHead := int64(99)
 	fresh := newConflictTestMetadata(t, &newHead)
 
-	out := rewriteRefSnapshotRequirements(reqs, MainBranch, fresh)
+	out := rewriteRefSnapshotRequirements(reqs, MainBranch, fresh, nil)
 	require.Len(t, out, 3)
 
 	a, ok := out[0].(*assertRefSnapshotID)
@@ -214,14 +214,21 @@ func TestRewriteRefSnapshotRequirements(t *testing.T) {
 	assert.Same(t, otherAssert, out[1])
 	assert.Same(t, uuidAssert, out[2])
 
+	// A pinned branch is an explicit compare-and-swap fence: its
+	// assertion must survive the rewrite untouched.
+	pinnedOut := rewriteRefSnapshotRequirements(reqs, MainBranch, fresh,
+		map[string]struct{}{MainBranch: {}})
+	assert.Same(t, mainAssert, pinnedOut[0],
+		"a pinned assertion must not be rewritten to the fresh head")
+
 	// Edge cases: empty branch / nil fresh / branch missing on fresh
 	// return the slice unchanged.
-	noBranchOut := rewriteRefSnapshotRequirements(reqs, "", fresh)
+	noBranchOut := rewriteRefSnapshotRequirements(reqs, "", fresh, nil)
 	assert.Equal(t, reqs, noBranchOut)
 
-	nilFreshOut := rewriteRefSnapshotRequirements(reqs, MainBranch, nil)
+	nilFreshOut := rewriteRefSnapshotRequirements(reqs, MainBranch, nil, nil)
 	assert.Equal(t, reqs, nilFreshOut)
 
-	missingBranchOut := rewriteRefSnapshotRequirements(reqs, "non-existent", fresh)
+	missingBranchOut := rewriteRefSnapshotRequirements(reqs, "non-existent", fresh, nil)
 	assert.Equal(t, reqs, missingBranchOut)
 }

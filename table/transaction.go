@@ -26,6 +26,7 @@ import (
 	"iter"
 	"log/slog"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -89,6 +90,14 @@ type Transaction struct {
 	// validator (they are safe under any isolation).
 	validators []conflictValidatorFunc
 
+	// pinnedRefs names the branches whose AssertRefSnapshotID
+	// requirements were registered explicitly via
+	// Transaction.AssertRefSnapshotID. doCommit's refresh-and-replay
+	// must not rewrite these to the fresh branch head between
+	// retries: the caller opted into compare-and-swap semantics, so
+	// a moved branch must fail the commit rather than be replayed.
+	pinnedRefs map[string]struct{}
+
 	mx        sync.Mutex
 	committed bool
 }
@@ -106,21 +115,39 @@ func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 		return err
 	}
 
+	// Deduplicate requirements so repeated producer commits in one
+	// transaction do not stack duplicate assertions. Most requirement
+	// types are table-scoped and keyed by type alone;
+	// assert-ref-snapshot-id is scoped to the ref it asserts, so it is
+	// keyed by (type, ref) — assertions for different branches must
+	// all be enforced. Two assertions for the SAME ref with different
+	// snapshot ids can never both hold against the catalog: that is a
+	// conflict inside the transaction, not a duplicate to collapse.
+	//
+	// Only requirements actually appended are validated against the
+	// staged metadata: a deduplicated requirement re-asserts the base
+	// state a later producer commit built on, which the staged
+	// metadata has intentionally moved past; its kept twin was
+	// validated when first added.
+	existing := make(map[string]Requirement, len(t.reqs))
+	for _, r := range t.reqs {
+		existing[requirementDedupKey(r)] = r
+	}
+
 	for _, r := range reqs {
+		key := requirementDedupKey(r)
+		if prev, ok := existing[key]; ok {
+			if err := checkRequirementConflict(prev, r); err != nil {
+				return err
+			}
+
+			continue
+		}
 		if err := r.Validate(current); err != nil {
 			return err
 		}
-	}
-
-	existing := map[string]struct{}{}
-	for _, r := range t.reqs {
-		existing[r.GetType()] = struct{}{}
-	}
-
-	for _, r := range reqs {
-		if _, ok := existing[r.GetType()]; !ok {
-			t.reqs = append(t.reqs, r)
-		}
+		existing[key] = r
+		t.reqs = append(t.reqs, r)
 	}
 
 	prevUpdates, prevLastUpdated := len(t.meta.updates), t.meta.lastUpdatedMS
@@ -140,6 +167,49 @@ func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 	}
 
 	return nil
+}
+
+// requirementDedupKey returns the identity under which a requirement is
+// deduplicated across a transaction. Most requirements are table-scoped
+// and keyed by type; assert-ref-snapshot-id asserts a single ref, so
+// assertions for distinct refs are distinct requirements.
+func requirementDedupKey(r Requirement) string {
+	if a, ok := r.(*assertRefSnapshotID); ok {
+		return a.GetType() + "\x00" + a.Ref
+	}
+
+	return r.GetType()
+}
+
+// checkRequirementConflict reports whether two requirements sharing a
+// dedup key can be collapsed into one. Identical ref assertions dedupe
+// to the first; two assert-ref-snapshot-id for the same ref pinning
+// different snapshot ids can never both hold, so keeping either one
+// would silently drop a check the caller registered — reject instead.
+func checkRequirementConflict(prev, next Requirement) error {
+	a, aok := prev.(*assertRefSnapshotID)
+	b, bok := next.(*assertRefSnapshotID)
+	if !aok || !bok {
+		return nil
+	}
+
+	if (a.SnapshotID == nil) != (b.SnapshotID == nil) ||
+		(a.SnapshotID != nil && *a.SnapshotID != *b.SnapshotID) {
+		return fmt.Errorf("conflicting snapshot-id assertions for ref %q: %s vs %s",
+			a.Ref, formatSnapshotID(a.SnapshotID), formatSnapshotID(b.SnapshotID))
+	}
+
+	return nil
+}
+
+// formatSnapshotID renders a pinned snapshot id for error messages; a
+// nil id asserts the ref's absence.
+func formatSnapshotID(id *int64) string {
+	if id == nil {
+		return "<ref absent>"
+	}
+
+	return strconv.FormatInt(*id, 10)
 }
 
 // addValidator appends a conflict validator under t.mx. Producers
@@ -177,6 +247,57 @@ func (t *Transaction) SetProperties(props iceberg.Properties) error {
 	if len(props) > 0 {
 		return t.apply([]Update{NewSetPropertiesUpdate(props)}, nil)
 	}
+
+	return nil
+}
+
+// AssertRefSnapshotID records a requirement that the given branch still
+// points at the snapshot id this transaction's metadata sees for it —
+// or that the branch still does not exist, when it has none — the same
+// requirement snapshot producers register at commit-build time. An
+// empty branch is treated as the main branch.
+//
+// It exists for optimistic concurrency on metadata-only commits: a
+// transaction carrying only metadata updates (for example SetProperties
+// used for exactly-once bookkeeping, such as recording ingestion
+// offsets) otherwise commits with just an AssertTableUUID requirement,
+// so the writer cannot detect that the table moved between its read
+// and the commit. With this fence the commit fails with a
+// commit-failed error if any snapshot was committed to the branch in
+// between.
+//
+// Unlike producer-registered assertions, the explicit fence is not
+// rewritten to the fresh branch head by the retry loop's
+// refresh-and-replay: the caller asked for compare-and-swap semantics,
+// so a moved branch surfaces as a failed commit instead of being
+// replayed.
+//
+// The requirement is submitted together with the transaction's
+// updates; a transaction with no updates never contacts the catalog,
+// so the fence alone does not force a commit. Requirements are
+// deduplicated by type across the transaction, so the first
+// AssertRefSnapshotID registered — explicit or producer-built — wins.
+func (t *Transaction) AssertRefSnapshotID(branch string) error {
+	if branch == "" {
+		branch = MainBranch
+	}
+
+	var id *int64
+	if ref, ok := t.meta.refs[branch]; ok {
+		snapshotID := ref.SnapshotID
+		id = &snapshotID
+	}
+
+	if err := t.apply(nil, []Requirement{AssertRefSnapshotID(branch, id)}); err != nil {
+		return err
+	}
+
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	if t.pinnedRefs == nil {
+		t.pinnedRefs = make(map[string]struct{})
+	}
+	t.pinnedRefs[branch] = struct{}{}
 
 	return nil
 }
@@ -1770,6 +1891,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs,
 			withCommitBranch(t.branch),
 			withCommitValidators(t.validators...),
+			withCommitPinnedRefs(t.pinnedRefs),
 		)
 		if err != nil {
 			return tbl, err

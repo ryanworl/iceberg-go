@@ -1115,6 +1115,22 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 	addSnap.ownManifests = ownManifests
 	addSnap.rebuildManifestList = rebuildFn
 
+	// Pin the assertion to the BASE table's branch head — the catalog
+	// state the writer read — not the staged metadata's current
+	// snapshot. Successive producer commits in one transaction stage
+	// intermediate snapshots that never exist on the catalog; asserting
+	// one of those ids could never hold, and the transaction's
+	// requirement dedup would reject it as conflicting with the first
+	// producer's base assertion. A nil id asserts the branch does not
+	// exist yet (this commit creates it).
+	var baseHeadID *int64
+	if sp.txn.tbl != nil {
+		if head := sp.txn.tbl.metadata.SnapshotByName(branch); head != nil {
+			id := head.SnapshotID
+			baseHeadID = &id
+		}
+	}
+
 	return []Update{
 			addSnap,
 			// Use 0 (not -1) for the optional fields so they are omitted by
@@ -1123,6 +1139,6 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 			// reject a payload that explicitly contains negative values.
 			NewSetSnapshotRefUpdate(branch, sp.snapshotID, BranchRef, 0, 0, 0),
 		}, []Requirement{
-			AssertRefSnapshotID(branch, sp.txn.meta.currentSnapshotID),
+			AssertRefSnapshotID(branch, baseHeadID),
 		}, nil
 }
