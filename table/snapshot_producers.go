@@ -176,7 +176,7 @@ func (of *overwriteFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 			path := entry.DataFile().FilePath()
 			content := entry.DataFile().ContentType()
 			_, isDeletedData := of.base.deletedFiles[path]
-			_, isDeletedDelete := of.base.deletedDeleteFiles[path]
+			isDeletedDelete := of.base.isRemovedDeleteFile(entry.DataFile())
 
 			isData := content == iceberg.EntryContentData
 			matched := (isDeletedData && isData) || (isDeletedDelete && !isData)
@@ -304,7 +304,7 @@ func (of *overwriteFiles) deletedEntries(ctx context.Context) ([]iceberg.Manifes
 			content := entry.DataFile().ContentType()
 
 			_, isDeletedData := of.base.deletedFiles[path]
-			_, isDeletedDelete := of.base.deletedDeleteFiles[path]
+			isDeletedDelete := of.base.isRemovedDeleteFile(entry.DataFile())
 
 			if (isDeletedData && content == iceberg.EntryContentData) ||
 				(isDeletedDelete && content != iceberg.EntryContentData) {
@@ -512,17 +512,21 @@ func (m *mergeAppendFiles) needsValidation() bool { return false }
 type snapshotProducer struct {
 	producerImpl
 
-	commitUuid         uuid.UUID
-	io                 iceio.WriteFileIO
-	txn                *Transaction
-	op                 Operation
-	snapshotID         int64
-	parentSnapshotID   int64
-	addedFiles         []iceberg.DataFile
-	addedDeleteFiles   []iceberg.DataFile
-	manifestCount      atomic.Int32
-	deletedFiles       map[string]iceberg.DataFile
-	deletedDeleteFiles map[string]iceberg.DataFile
+	commitUuid       uuid.UUID
+	io               iceio.WriteFileIO
+	txn              *Transaction
+	op               Operation
+	snapshotID       int64
+	parentSnapshotID int64
+	addedFiles       []iceberg.DataFile
+	addedDeleteFiles []iceberg.DataFile
+	manifestCount    atomic.Int32
+	deletedFiles     map[string]iceberg.DataFile
+	// deletedDeleteFiles holds delete files registered for removal,
+	// grouped by file path. A path can carry several removals with
+	// distinct referenced data files (multi-blob Puffin); see
+	// isRemovedDeleteFile for the matching rule.
+	deletedDeleteFiles map[string][]iceberg.DataFile
 	snapshotProps      iceberg.Properties
 }
 
@@ -551,7 +555,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 		parentSnapshotID:   parentSnapshot,
 		addedFiles:         []iceberg.DataFile{},
 		deletedFiles:       make(map[string]iceberg.DataFile),
-		deletedDeleteFiles: make(map[string]iceberg.DataFile),
+		deletedDeleteFiles: make(map[string][]iceberg.DataFile),
 		snapshotProps:      snapshotProps,
 	}
 }
@@ -582,10 +586,44 @@ func (sp *snapshotProducer) deleteDataFile(df iceberg.DataFile) *snapshotProduce
 	return sp
 }
 
+// referencedDataFile returns df's referenced data file, or "" when the
+// field is unset.
+func referencedDataFile(df iceberg.DataFile) string {
+	if ref := df.ReferencedDataFile(); ref != nil {
+		return *ref
+	}
+
+	return ""
+}
+
 func (sp *snapshotProducer) removeDeleteFile(df iceberg.DataFile) *snapshotProducer {
-	sp.deletedDeleteFiles[df.FilePath()] = df
+	path := df.FilePath()
+	for _, existing := range sp.deletedDeleteFiles[path] {
+		if referencedDataFile(existing) == referencedDataFile(df) {
+			return sp
+		}
+	}
+	sp.deletedDeleteFiles[path] = append(sp.deletedDeleteFiles[path], df)
 
 	return sp
+}
+
+// isRemovedDeleteFile reports whether the given delete-manifest entry's
+// file was registered for removal via removeDeleteFile. Removal
+// identity is (file path, referenced data file), not path alone: a
+// multi-blob Puffin file legally carries deletion vectors for several
+// data files under one path, one manifest entry each, and removing one
+// blob's entry must not drop its siblings. A removal without a
+// referenced data file matches only entries that also record none
+// (plain delete files).
+func (sp *snapshotProducer) isRemovedDeleteFile(df iceberg.DataFile) bool {
+	for _, removed := range sp.deletedDeleteFiles[df.FilePath()] {
+		if referencedDataFile(removed) == referencedDataFile(df) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts ...iceberg.ManifestWriterOption) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
@@ -800,9 +838,11 @@ func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {
 
 	if len(sp.deletedDeleteFiles) > 0 {
 		specs := sp.txn.meta.specs
-		for _, df := range sp.deletedDeleteFiles {
-			if err = ssc.removeFile(df, currentSchema, specs[df.SpecID()]); err != nil {
-				return Summary{}, err
+		for _, dfs := range sp.deletedDeleteFiles {
+			for _, df := range dfs {
+				if err = ssc.removeFile(df, currentSchema, specs[df.SpecID()]); err != nil {
+					return Summary{}, err
+				}
 			}
 		}
 	}
