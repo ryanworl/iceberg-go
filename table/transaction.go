@@ -320,6 +320,33 @@ func (t *Transaction) AssertRefSnapshotID(branch string) error {
 	return nil
 }
 
+// AssertDefaultShape registers requirements pinning the table's default
+// partition spec ID and default sort order ID at their values in the
+// transaction's base metadata, so a concurrent change to either fails
+// this commit instead of interleaving silently — the shape analogue of
+// AssertRefSnapshotID's explicit branch fence. It gives commits that
+// stage no shape change of their own (for example a properties-only
+// revision marker) the same serialization against concurrent spec or
+// sort-order evolutions that UpdateSpec's and ReplaceSortOrder's
+// producer-built assertions give shape-changing commits; when both are
+// present they pin the same base values and deduplicate by type.
+//
+// Register the fence BEFORE staging spec or sort-order changes:
+// requirements are validated against the staged metadata at
+// registration time, so a fence registered after the transaction moved
+// a default fails immediately. Unlike ref assertions the fence is never
+// rewritten by the retry loop's refresh-and-replay, and a transaction
+// with no updates never contacts the catalog, so the fence alone does
+// not force a commit.
+func (t *Transaction) AssertDefaultShape() error {
+	meta := t.tbl.Metadata()
+
+	return t.apply(nil, []Requirement{
+		AssertDefaultSpecID(meta.DefaultPartitionSpec()),
+		AssertDefaultSortOrderID(meta.DefaultSortOrder()),
+	})
+}
+
 // UpgradeFormatVersion upgrades the table to the given format version. Downgrading
 // is not allowed. If the table is already at the given version, this is a no-op.
 func (t *Transaction) UpgradeFormatVersion(version int) error {
