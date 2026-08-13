@@ -436,6 +436,51 @@ func TestUpdateSpecBuildChanges(t *testing.T) {
 	})
 }
 
+// TestUpdateSpecReusesHistoricalFieldIDsV3: Iceberg requires that
+// re-adding a historical partition field (same source, transform, and
+// name) reuses its original field ID on v2 AND v3 tables. Remove a
+// field on a v3 table, re-add it, and assert the original ID comes
+// back.
+func TestUpdateSpecReusesHistoricalFieldIDsV3(t *testing.T) {
+	metaV3, err := table.NewMetadata(testSchema, &partitionSpec, table.UnsortedSortOrder, "",
+		iceberg.Properties{"format-version": "3"})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, metaV3.Version())
+	tblV3 := table.New([]string{"partitioned_v3"}, metaV3, "", nil, nil)
+
+	fieldByName := func(spec iceberg.PartitionSpec, name string) *iceberg.PartitionField {
+		for _, f := range spec.Fields() {
+			if f.Name == name {
+				return &f
+			}
+		}
+
+		return nil
+	}
+
+	original := fieldByName(metaV3.PartitionSpec(), "id_identity")
+	assert.NotNil(t, original)
+
+	txn := tblV3.NewTransaction()
+	assert.NoError(t, table.NewUpdateSpec(txn, false).RemoveField("id_identity").Commit())
+	removed, err := txn.StagedTable()
+	assert.NoError(t, err)
+	assert.Nil(t, fieldByName(removed.Spec(), "id_identity"))
+
+	txn2 := removed.NewTransaction()
+	specUpdate := table.NewUpdateSpec(txn2, false).
+		AddField("id", iceberg.IdentityTransform{}, "id_identity")
+	_, _, err = specUpdate.BuildUpdates()
+	assert.NoError(t, err)
+
+	newSpec, err := specUpdate.Apply()
+	assert.NoError(t, err)
+	readded := fieldByName(newSpec, "id_identity")
+	assert.NotNil(t, readded)
+	assert.Equal(t, original.FieldID, readded.FieldID, "v3 must reuse the historical partition field ID")
+	assert.Equal(t, original.SourceID(), readded.SourceID())
+}
+
 func TestUpdateSpecCommit(t *testing.T) {
 	var txn *table.Transaction
 

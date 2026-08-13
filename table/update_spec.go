@@ -322,7 +322,7 @@ func (us *UpdateSpec) renameField(name string, newName string) updateSpecOp {
 }
 
 func (us *UpdateSpec) partitionField(key transformKey, name string) (iceberg.PartitionField, error) {
-	if us.txn.tbl.Metadata().Version() == 2 {
+	if us.txn.tbl.Metadata().Version() >= 2 {
 		sourceId, transform := key.SourceId, key.Transform
 		historicalFields := make([]iceberg.PartitionField, 0)
 		for _, spec := range us.txn.tbl.Metadata().PartitionSpecs() {
