@@ -250,6 +250,40 @@ func getCollector() map[int]internal.StatisticsCollector {
 	}
 }
 
+// TestMetricsSkipColumnOutsidePlan: a file column whose field id has no
+// entry in the metrics plan — e.g. a writer-materialized column that is
+// not part of the table schema — must be skipped entirely, not
+// aggregated through a zero-value collector (whose nil Iceberg type
+// panics inside the stats aggregator).
+func TestMetricsSkipColumnOutsidePlan(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	meta, tblMeta := constructTestTablePrimitiveTypes(t)
+	mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	collector := getCollector()
+	delete(collector, 12) // "binaries" is now outside the plan
+
+	stats := format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil)
+	df := stats.ToDataFile(internal.DataFileOpts{
+		Schema:   tblMeta.CurrentSchema(),
+		Spec:     tblMeta.PartitionSpec(),
+		Path:     "fake-path.parquet",
+		Format:   iceberg.ParquetFile,
+		Content:  iceberg.EntryContentData,
+		FileSize: meta.GetSourceFileSize(),
+	})
+
+	assert.NotContains(t, df.ValueCounts(), 12)
+	assert.NotContains(t, df.NullValueCounts(), 12)
+	assert.NotContains(t, df.ColumnSizes(), 12)
+	assert.NotContains(t, df.LowerBoundValues(), 12)
+	assert.NotContains(t, df.UpperBoundValues(), 12)
+	assert.Len(t, df.ValueCounts(), 14)
+	assert.Len(t, df.LowerBoundValues(), 14)
+}
+
 func TestMetricsPrimitiveTypes(t *testing.T) {
 	format := internal.GetFileFormat(iceberg.ParquetFile)
 

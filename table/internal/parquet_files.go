@@ -621,8 +621,12 @@ func (p parquetFormat) DataFileStatsFromMeta(meta Metadata, statsCols map[int]St
 
 				panic(fmt.Errorf("column chunk %q not found in column mapping", colChunk.PathInSchema()))
 			}
-			statsCol := statsCols[fieldID]
-			if statsCol.Mode.Typ == MetricModeNone {
+			statsCol, ok := statsCols[fieldID]
+			if !ok || statsCol.Mode.Typ == MetricModeNone {
+				// A field id with no collector entry is a file column
+				// outside the table schema (for example a writer's
+				// materialized lineage column); collect nothing for it
+				// rather than aggregating with a zero-value collector.
 				continue
 			}
 
