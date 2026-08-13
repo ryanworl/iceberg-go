@@ -725,15 +725,6 @@ func validateDataFilePartitionData(df iceberg.DataFile, spec *iceberg.PartitionS
 // validateDataFilesToAdd performs metadata-only validation for caller-provided
 // DataFiles and returns a set of paths that passed validation.
 func (t *Transaction) validateDataFilesToAdd(dataFiles []iceberg.DataFile, operation string) (map[string]struct{}, error) {
-	currentSpec, err := t.meta.CurrentSpec()
-	if err != nil {
-		return nil, fmt.Errorf("could not get current partition spec: %w", err)
-	}
-	if currentSpec == nil {
-		return nil, errors.New("could not get current partition spec: no current partition spec found")
-	}
-
-	expectedSpecID := int32(currentSpec.ID())
 	setToAdd := make(map[string]struct{}, len(dataFiles))
 
 	for i, df := range dataFiles {
@@ -761,12 +752,16 @@ func (t *Transaction) validateDataFilesToAdd(dataFiles []iceberg.DataFile, opera
 			return nil, fmt.Errorf("data file %s has invalid file format %s for %s", path, df.FileFormat(), operation)
 		}
 
-		if df.SpecID() != expectedSpecID {
-			return nil, fmt.Errorf("data file %s has invalid partition spec id %d for %s: expected %d",
-				path, df.SpecID(), operation, expectedSpecID)
+		// A data file may target any partition spec registered in the
+		// table metadata, not just the default: its manifest is
+		// written with that spec (see snapshotProducer.manifestProducer).
+		spec, err := t.meta.GetSpecByID(int(df.SpecID()))
+		if err != nil || spec == nil {
+			return nil, fmt.Errorf("data file %s has unregistered partition spec id %d for %s",
+				path, df.SpecID(), operation)
 		}
 
-		if err := validateDataFilePartitionData(df, currentSpec); err != nil {
+		if err := validateDataFilePartitionData(df, spec); err != nil {
 			return nil, fmt.Errorf("data file %s has invalid partition data for %s: %w", path, operation, err)
 		}
 
@@ -851,6 +846,11 @@ func (t *Transaction) ensureNameMapping() error {
 //
 // Unlike AddFiles, this method does not read files from storage. It validates only metadata
 // that can be checked without opening files (for example spec-id and partition field IDs).
+//
+// Each DataFile may target any partition spec registered in the table metadata,
+// identified by its SpecID; files are grouped into one manifest per spec. This
+// permits writers to continue producing data under a previous spec after an
+// evolution, and rewrites that migrate files between specs.
 //
 // By default this method automatically sets the schema name mapping in table
 // properties if one does not already exist. Pass [WithoutAutoNameMapping] to

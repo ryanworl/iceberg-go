@@ -1302,7 +1302,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	tx = tbl.NewTransaction()
 	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
-	t.ErrorContains(err, "invalid partition spec id")
+	t.ErrorContains(err, "unregistered partition spec id")
 }
 
 func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionData() {

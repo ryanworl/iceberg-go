@@ -763,43 +763,62 @@ func (sp *snapshotProducer) manifests(ctx context.Context) (_ []iceberg.Manifest
 
 func (sp *snapshotProducer) manifestProducer(content iceberg.ManifestContent, files []iceberg.DataFile, output *[]iceberg.ManifestFile) func() (err error) {
 	return func() (err error) {
-		out, path, err := sp.newManifestOutput()
-		if err != nil {
-			return err
-		}
-		defer internal.CheckedClose(out, &err)
-
-		counter := &internal.CountingWriter{W: out}
-		currentSpec, err := sp.txn.meta.CurrentSpec()
-		if err != nil || currentSpec == nil {
-			return fmt.Errorf("could not get current partition spec: %w", err)
-		}
-		wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
-			*currentSpec, sp.txn.meta.CurrentSchema(),
-			sp.snapshotID, iceberg.WithManifestWriterContent(content))
-		if err != nil {
-			return err
-		}
-		defer internal.CheckedClose(wr, &err)
-
+		// Group added files by partition spec so each manifest is
+		// written with the spec its files' partition tuples are
+		// encoded with. Files may target any spec registered in the
+		// table metadata, not just the default — the shape of Java's
+		// MergingSnapshotProducer, which keeps one writer per spec.
+		groups := make(map[int][]iceberg.DataFile)
 		for _, df := range files {
-			err := wr.Add(iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &sp.snapshotID,
-				nil, nil, df))
+			groups[int(df.SpecID())] = append(groups[int(df.SpecID())], df)
+		}
+
+		writeGroup := func(specID int, files []iceberg.DataFile) (_ iceberg.ManifestFile, retErr error) {
+			spec, err := sp.txn.meta.GetSpecByID(specID)
+			if err != nil || spec == nil {
+				return nil, fmt.Errorf("cannot write manifest for unregistered partition spec %d: %w", specID, err)
+			}
+
+			out, path, err := sp.newManifestOutput()
+			if err != nil {
+				return nil, err
+			}
+			defer internal.CheckedClose(out, &retErr)
+
+			counter := &internal.CountingWriter{W: out}
+			wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
+				*spec, sp.txn.meta.CurrentSchema(),
+				sp.snapshotID, iceberg.WithManifestWriterContent(content))
+			if err != nil {
+				return nil, err
+			}
+			defer internal.CheckedClose(wr, &retErr)
+
+			for _, df := range files {
+				err := wr.Add(iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &sp.snapshotID,
+					nil, nil, df))
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			// close the writer to force a flush and ensure counter.Count is accurate
+			if err := wr.Close(); err != nil {
+				return nil, err
+			}
+
+			return wr.ToManifestFile(path, counter.Count, iceberg.WithManifestFileContent(content))
+		}
+
+		manifests := make([]iceberg.ManifestFile, 0, len(groups))
+		for _, specID := range slices.Sorted(maps.Keys(groups)) {
+			mf, err := writeGroup(specID, groups[specID])
 			if err != nil {
 				return err
 			}
+			manifests = append(manifests, mf)
 		}
-
-		// close the writer to force a flush and ensure counter.Count is accurate
-		if err := wr.Close(); err != nil {
-			return err
-		}
-
-		mf, err := wr.ToManifestFile(path, counter.Count, iceberg.WithManifestFileContent(content))
-		if err != nil {
-			return err
-		}
-		*output = []iceberg.ManifestFile{mf}
+		*output = manifests
 
 		return nil
 	}
