@@ -1421,6 +1421,29 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 	return dataFiles, nil
 }
 
+// FileToDataFile builds a DataFile for an existing parquet file at
+// filePath, reading its footer to populate record count, file size,
+// column sizes, value/null counts and lower/upper bounds, and to infer
+// partition values for order-preserving transforms. It is the exported
+// counterpart of the conversion used by Transaction.AddFiles, for
+// callers that write files themselves (for example a compaction
+// rewrite) and need stats-bearing DataFiles to commit through
+// Transaction.AddDataFiles or a rewrite operation.
+func FileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) (df iceberg.DataFile, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case error:
+				err = fmt.Errorf("error encountered during file conversion: %w", e)
+			default:
+				err = fmt.Errorf("error encountered during file conversion: %v", e)
+			}
+		}
+	}()
+
+	return fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, sortOrderID, props), nil
+}
+
 func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) iceberg.DataFile {
 	format := tblutils.FormatFromFileName(filePath)
 	rdr := must(format.Open(ctx, fileIO, filePath))

@@ -353,6 +353,41 @@ func (t *Transaction) UpdateSpec(caseSensitive bool) *UpdateSpec {
 	return NewUpdateSpec(t, caseSensitive)
 }
 
+// ReplaceSortOrder stages order as the table's new default sort order,
+// the analogue of Java's Table.replaceSortOrder(). The metadata
+// builder reuses the ID of an equivalent existing order or assigns the
+// next available one, so order's own ID is ignored. The commit is
+// fenced by an assertion that the default sort order has not changed
+// underneath the transaction. Replacing the default with a
+// field-identical order is a no-op.
+func (t *Transaction) ReplaceSortOrder(order SortOrder) error {
+	if cur, err := t.meta.GetSortOrderByID(t.meta.defaultSortOrderID); err == nil && sameSortFields(*cur, order) {
+		return nil
+	}
+
+	return t.apply(
+		[]Update{NewAddSortOrderUpdate(&order), NewSetDefaultSortOrderUpdate(-1)},
+		[]Requirement{AssertDefaultSortOrderID(t.tbl.Metadata().DefaultSortOrder())},
+	)
+}
+
+func sameSortFields(a, b SortOrder) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+	bFields := make([]SortField, 0, b.Len())
+	for _, f := range b.Fields() {
+		bFields = append(bFields, f)
+	}
+	for i, f := range a.Fields() {
+		if !f.Equals(bFields[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // UpdateSchema creates a new UpdateSchema instance for managing schema changes
 // within this transaction.
 //
