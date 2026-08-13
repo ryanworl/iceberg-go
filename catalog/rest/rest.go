@@ -389,7 +389,18 @@ func handleNon200(rsp *http.Response, override map[int]error) error {
 
 		decErr := json.NewDecoder(rsp.Body).Decode(&payload)
 		if decErr != nil && decErr != io.EOF {
-			return fmt.Errorf("%w: failed to decode error response: %s", ErrRESTError, decErr.Error())
+			// A status the caller mapped keeps its mapped classification even
+			// when the error body is not valid JSON (e.g. a proxy replaced it
+			// with an HTML error page): the override carries the semantics of
+			// the status line itself, such as an ambiguous commit 5xx staying
+			// ErrCommitStateUnknown. Statuses without an override keep the
+			// plain decode-failure classification.
+			wrapped := ErrRESTError
+			if statusErr, ok := override[rsp.StatusCode]; ok {
+				wrapped = statusErr
+			}
+
+			return fmt.Errorf("%w: failed to decode error response: %s", wrapped, decErr.Error())
 		}
 
 		if e.Message == "" && e.Type == "" {
