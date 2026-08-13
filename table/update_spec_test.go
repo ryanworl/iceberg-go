@@ -389,11 +389,12 @@ func TestUpdateSpecBuildChanges(t *testing.T) {
 		assert.NotNil(t, reqs)
 
 		assert.Equal(t, 2, len(updates))
-		assert.Equal(t, 1, len(reqs))
+		assert.Equal(t, 2, len(reqs))
 
 		assert.Equal(t, table.UpdateAddSpec, updates[0].Action())
 		assert.Equal(t, table.UpdateSetDefaultSpec, updates[1].Action())
 		assert.Equal(t, "assert-last-assigned-partition-id", reqs[0].GetType())
+		assert.Equal(t, "assert-default-spec-id", reqs[1].GetType())
 	})
 
 	t.Run("build changes on removed partition field", func(t *testing.T) {
@@ -408,11 +409,12 @@ func TestUpdateSpecBuildChanges(t *testing.T) {
 		assert.NotNil(t, reqs)
 
 		assert.Equal(t, 2, len(updates))
-		assert.Equal(t, 1, len(reqs))
+		assert.Equal(t, 2, len(reqs))
 
 		assert.Equal(t, table.UpdateAddSpec, updates[0].Action())
 		assert.Equal(t, table.UpdateSetDefaultSpec, updates[1].Action())
 		assert.Equal(t, "assert-last-assigned-partition-id", reqs[0].GetType())
+		assert.Equal(t, "assert-default-spec-id", reqs[1].GetType())
 	})
 
 	t.Run("build changes on renamed partition field", func(t *testing.T) {
@@ -425,11 +427,12 @@ func TestUpdateSpecBuildChanges(t *testing.T) {
 
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(updates))
-		assert.Equal(t, 1, len(reqs))
+		assert.Equal(t, 2, len(reqs))
 
 		assert.Equal(t, table.UpdateAddSpec, updates[0].Action())
 		assert.Equal(t, table.UpdateSetDefaultSpec, updates[1].Action())
 		assert.Equal(t, "assert-last-assigned-partition-id", reqs[0].GetType())
+		assert.Equal(t, "assert-default-spec-id", reqs[1].GetType())
 	})
 }
 

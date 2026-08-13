@@ -130,6 +130,7 @@ func (us *UpdateSpec) BuildUpdates() ([]Update, []Requirement, error) {
 		}
 		requiredLastAssignedPartitionId := us.txn.tbl.Metadata().LastPartitionSpecID()
 		requirements = append(requirements, AssertLastAssignedPartitionID(*requiredLastAssignedPartitionId))
+		requirements = append(requirements, AssertDefaultSpecID(us.txn.tbl.Metadata().DefaultPartitionSpec()))
 	}
 
 	return updates, requirements, nil
